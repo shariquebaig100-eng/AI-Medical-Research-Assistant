@@ -1,0 +1,183 @@
+const { v4: uuidv4 } = require('uuid');
+const Session = require('../model/Session');
+const { retrieveResearch } = require('../services/researchService');
+const { generateMedicalResponseStream, generateFallbackResponse } = require('../services/llmService');
+
+function needsReRetrieval(message, conversationLength) {
+  if (conversationLength === 0) return true;
+  const indicators = [
+    'what about','how about','tell me about','what is','explain',
+    'latest','recent','new','different','instead','alternative',
+    'vitamin','drug','treatment','therapy','study','research','trial'
+  ];
+  const lower = message.toLowerCase();
+  return indicators.some(i => lower.includes(i));
+}
+
+function extractQueryContext(message) {
+  const patterns = [
+    /(?:for|about|with|treat(?:ment for)?)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)*(?:'s)?(?:\s+disease|\s+syndrome|\s+cancer|\s+disorder)?)/i,
+    /((?:lung|breast|colon|prostate|skin) cancer)/i,
+    /(diabetes(?:\s+type\s+[12])?)/i,
+    /(alzheimer'?s?|parkinson'?s?|huntington'?s?)/i,
+    /((?:heart|cardiovascular|kidney|liver|lung) (?:disease|failure|condition))/i
+  ];
+  for (const p of patterns) {
+    const m = message.match(p);
+    if (m) return m[1] || m[0];
+  }
+  return null;
+}
+
+// ─── Detect researcher intent ─────────────────────────────────────────────────
+function isResearcherQuery(message) {
+  const lower = message.toLowerCase();
+  return lower.includes('researcher') || lower.includes('top researcher') ||
+    lower.includes('who studies') || lower.includes('leading expert') ||
+    lower.includes('best doctor');
+}
+
+// ─── POST /api/chat  (SSE streaming) ─────────────────────────────────────────
+exports.sendMessage = async (req, res) => {
+  // Set up SSE headers immediately
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', process.env.FRONTEND_URL || '*');
+  res.flushHeaders();
+
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 15000);
+
+  try {
+    const { sessionId, message, patientName, disease: explicitDisease, location, intent } = req.body;
+
+    if (!message?.trim()) {
+      res.write(`data: ${JSON.stringify({ error: 'Message is required' })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      clearInterval(heartbeat);
+      return res.end();
+    }
+
+    const sid = sessionId || uuidv4();
+    let session = await Session.findOne({ sessionId: sid });
+    if (!session) {
+      session = new Session({ sessionId: sid, patientName: patientName || '', disease: explicitDisease || '', location: location || '' });
+    }
+
+    if (patientName) session.patientName = patientName;
+    if (explicitDisease) session.disease = explicitDisease;
+    if (location) session.location = location;
+
+    const effectiveDisease = explicitDisease || session.disease || extractQueryContext(message) || '';
+    const researcherMode = isResearcherQuery(message);
+
+    session.messages.push({ role: 'user', content: message, metadata: { disease: effectiveDisease, intent, location } });
+
+    const conversationHistory = session.getRecentMessages(10);
+    const shouldRetrieve = needsReRetrieval(message, conversationHistory.length - 1);
+
+    let publications = [], trials = [], retrievalStats = {};
+
+    if (shouldRetrieve) {
+      console.log(`🔬 Retrieving for: "${message}" | Disease: "${effectiveDisease}" | ResearcherMode: ${researcherMode}`);
+
+      const results = await retrieveResearch({
+        query: message,
+        disease: effectiveDisease,
+        intent: intent || '',
+        location: session.location,
+        researcherMode
+      });
+
+      publications = results.publications;
+      trials = results.trials;
+      retrievalStats = {
+        ...results.totalRetrieved,
+        llmExpanded: results.llmExpanded,
+        queryVariants: results.queryVariants
+      };
+
+      // Send research data BEFORE the LLM starts streaming
+      res.write(`data: ${JSON.stringify({ type: 'research', publications, trials, retrievalStats, sessionId: sid, context: { disease: effectiveDisease, patientName: session.patientName, location: session.location } })}\n\n`);
+    }
+
+    // Stream the LLM response token by token
+    const fullResponse = await generateMedicalResponseStream({
+      res,
+      userQuery: message,
+      disease: effectiveDisease,
+      patientName: session.patientName,
+      intent: intent || '',
+      publications,
+      trials,
+      conversationHistory: conversationHistory.slice(0, -1)
+    });
+
+    // Save to MongoDB
+    session.messages.push({
+      role: 'assistant',
+      content: fullResponse,
+      metadata: { disease: effectiveDisease, publicationsCount: publications.length, trialsCount: trials.length }
+    });
+
+    if (session.messages.length > 50) session.messages = session.messages.slice(-40);
+    await session.save();
+
+    // Signal completion
+    res.write(`data: [DONE]\n\n`);
+
+  } catch (err) {
+    console.error('Chat stream error:', err);
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    res.write('data: [DONE]\n\n');
+  } finally {
+    clearInterval(heartbeat);
+    res.end();
+  }
+};
+
+// ─── POST /api/chat/feedback ──────────────────────────────────────────────────
+exports.submitFeedback = async (req, res) => {
+  try {
+    const { sessionId, messageIndex, rating, comment } = req.body;
+    if (!sessionId || rating === undefined) {
+      return res.status(400).json({ error: 'sessionId and rating required' });
+    }
+
+    const session = await Session.findOne({ sessionId });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    // Store feedback on the specific message
+    const msg = session.messages[messageIndex];
+    if (msg) {
+      msg.metadata = msg.metadata || {};
+      msg.metadata.feedback = { rating, comment: comment || '', timestamp: new Date() };
+      await session.save();
+    }
+
+    console.log(`👍 Feedback: session=${sessionId} msg=${messageIndex} rating=${rating}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// ─── GET /api/chat/:sessionId ─────────────────────────────────────────────────
+exports.getSession = async (req, res) => {
+  try {
+    const session = await Session.findOne({ sessionId: req.params.sessionId });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    res.json({ sessionId: session.sessionId, patientName: session.patientName, disease: session.disease, location: session.location, messages: session.getRecentMessages(20), createdAt: session.createdAt });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+exports.clearSession = async (req, res) => {
+  try {
+    await Session.findOneAndDelete({ sessionId: req.params.sessionId });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
